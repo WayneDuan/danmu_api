@@ -5,7 +5,7 @@ dotenv.config();
 import test from 'node:test';
 import assert from 'node:assert';
 import { handleRequest } from './worker.js';
-import { extractTitleSeasonEpisode, getBangumi, getComment, matchAnime, searchAnime } from "./apis/dandan-api.js";
+import { extractTitleSeasonEpisode, getBangumi, getComment, matchAnime, searchAnime, buildSearchAnimeUrl } from "./apis/dandan-api.js";
 import { getRedisKey, pingRedis, setRedisKey, setRedisKeyWithExpiry } from "./utils/redis-util.js";
 import { getLocalRedisKey, setLocalRedisKey, setLocalRedisKeyWithExpiry } from "./utils/local-redis-util.js";
 import { getImdbepisodes } from "./utils/imdb-util.js";
@@ -33,11 +33,14 @@ import { VercelHandler } from "./configs/handlers/vercel-handler.js";
 import { NetlifyHandler } from "./configs/handlers/netlify-handler.js";
 import { CloudflareHandler } from "./configs/handlers/cloudflare-handler.js";
 import { EdgeoneHandler } from "./configs/handlers/edgeone-handler.js";
+import { HuggingfaceHandler } from "./configs/handlers/huggingface-handler.js";
+import { HandlerFactory } from "./configs/handlers/handler-factory.js";
 import { Globals } from "./configs/globals.js";
 import { addAnime, addEpisode } from "./utils/cache-util.js";
 import { convertToAsciiSum } from "./utils/codec-util.js";
 import { handleDanmusLike } from "./utils/danmu-util.js";
 import { Segment, SegmentListResponse } from "./models/dandan-model.js"
+import { initBangumiData, searchBangumiData, clearBangumiDataCache } from "./utils/bangumi-data-util.js";
 
 // Mock Request class for testing
 class MockRequest {
@@ -135,6 +138,91 @@ test('worker.js API endpoints', async (t) => {
     const body = await parseResponse(res);
 
     assert.equal(res.status, 200);
+  });
+
+  await t.test('HandlerFactory should support Hugging Face Spaces', async () => {
+    const handler = await HandlerFactory.getHandler('huggingface');
+
+    assert(handler instanceof HuggingfaceHandler);
+    assert(HandlerFactory.getSupportedPlatforms().includes('huggingface'));
+  });
+
+  await t.test('HuggingfaceHandler should call Space variables and restart APIs', async () => {
+    const env = {
+      DEPLOY_PLATFROM_ACCOUNT: 'hf-user',
+      DEPLOY_PLATFROM_PROJECT: 'hf-space',
+      DEPLOY_PLATFROM_TOKEN: 'hf-token'
+    };
+    Globals.init(env);
+    const globals = Globals.getConfig();
+    const handler = new HuggingfaceHandler();
+
+    await withMockFetch(async (url, options) => {
+      if (url === 'https://huggingface.co/api/spaces/hf-user/hf-space/variables' && options.method === 'POST') {
+        assert.equal(options.headers.Authorization, 'Bearer hf-token');
+        assert.deepEqual(JSON.parse(options.body), { key: 'DANMU_LIMIT', value: '1' });
+        return mockJsonResponse({}, url);
+      }
+      if (url === 'https://huggingface.co/api/spaces/hf-user/hf-space/variables' && options.method === 'DELETE') {
+        assert.equal(options.headers.Authorization, 'Bearer hf-token');
+        assert.deepEqual(JSON.parse(options.body), { key: 'DANMU_LIMIT' });
+        return mockJsonResponse({}, url);
+      }
+      if (url === 'https://huggingface.co/api/spaces/hf-user/hf-space/restart' && options.method === 'POST') {
+        assert.equal(options.headers.Authorization, 'Bearer hf-token');
+        return mockJsonResponse({}, url);
+      }
+      throw new Error(`Unexpected request: ${options.method} ${url}`);
+    }, async () => {
+      assert.equal(await handler.setEnv('DANMU_LIMIT', 1), true);
+      assert.equal(globals.env.DANMU_LIMIT, 1);
+      assert.equal(await handler.delEnv('DANMU_LIMIT'), true);
+      assert.equal(await handler.deploy(), true);
+    });
+  });
+
+  await t.test('BilibiliSource should resolve b23.tv short links from redirect location', async () => {
+    Globals.init({});
+    const source = new BilibiliSource();
+    const shortUrl = 'https://b23.tv/BV1GJ411x7h7';
+    const targetUrl = 'https://www.bilibili.com/video/BV1GJ411x7h7';
+    let seenRedirectMode;
+
+    await withMockFetch(async (url, options) => {
+      assert.equal(url, shortUrl);
+      seenRedirectMode = options.redirect;
+      return {
+        ok: false,
+        status: 302,
+        url: shortUrl,
+        headers: new Headers({ location: targetUrl }),
+        text: async () => '',
+      };
+    }, async () => {
+      const resolvedUrl = await source.resolveB23Link(shortUrl);
+      assert.equal(resolvedUrl, targetUrl);
+    });
+
+    assert.equal(seenRedirectMode, 'manual');
+  });
+
+  await t.test('buildSearchAnimeUrl should preserve special characters in keyword', async () => {
+    const searchUrl = buildSearchAnimeUrl(`${urlPrefix}/api/v2/match`, 'Love & Death', 1, 2);
+
+    assert.equal(searchUrl.pathname, '/api/v2/search/anime');
+    assert.equal(searchUrl.searchParams.get('keyword'), 'Love & Death');
+    assert.equal(searchUrl.searchParams.get('season'), '1');
+    assert.equal(searchUrl.searchParams.get('episode'), '2');
+    assert.equal(searchUrl.searchParams.has(' Death'), false);
+  });
+
+  await t.test('buildSearchAnimeUrl should derive /search/anime from /search/episodes requests', async () => {
+    const searchUrl = buildSearchAnimeUrl(`${urlPrefix}/api/v2/search/episodes?anime=Love%20%26%20Death&episode=2`, 'Love & Death');
+
+    assert.equal(searchUrl.pathname, '/api/v2/search/anime');
+    assert.equal(searchUrl.searchParams.get('keyword'), 'Love & Death');
+    assert.equal(searchUrl.searchParams.has('season'), false);
+    assert.equal(searchUrl.searchParams.has('episode'), false);
   });
 
   // 测试标题解析
@@ -1060,6 +1148,153 @@ test('worker.js API endpoints', async (t) => {
   //   assert(res.length > 2, `Expected res.length > 2, but got ${res.length}`);
   // });
 
+  await t.test('Hanjutv warmup should retry after failure and share concurrent promise', async () => {
+    const source = new HanjutvSource();
+    let attempts = 0;
+    let finishFirst;
+    source.buildMobileHeaders = async () => ({ uid: 'stable-uid', headers: {} });
+    source.warmupMobileIdentity = async () => {
+      attempts++;
+      if (attempts === 1) return new Promise(resolve => { finishFirst = resolve; });
+      return true;
+    };
+
+    const concurrent = [source.ensureMobileIdentityWarmed(), source.ensureMobileIdentityWarmed()];
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(attempts, 1);
+    finishFirst(false);
+    await Promise.all(concurrent);
+    await source.ensureMobileIdentityWarmed();
+    await source.ensureMobileIdentityWarmed();
+    assert.equal(attempts, 2);
+  });
+
+  await t.test('Hanjutv details should stay fully parallel and preserve candidate order', async () => {
+    const source = new HanjutvSource();
+    const candidates = Array.from({ length: 6 }, (_, index) => ({ sid: `sid-${index}`, name: `顺序测试剧${index}` }));
+    const resolvers = new Map();
+    const started = [];
+    const previous = { animes: Globals.animes, episodeIds: Globals.episodeIds, episodeNum: Globals.episodeNum };
+    Globals.animes = [];
+    Globals.episodeIds = [];
+    Globals.episodeNum = 10001;
+    source.buildAnimePayload = anime => new Promise(resolve => {
+      started.push(anime.sid);
+      resolvers.set(anime.sid, resolve);
+    });
+    source.sortAndPushAnimesByYear = (items, target) => target.push(...items);
+
+    try {
+      const current = [];
+      const task = source.handleAnimes(candidates, '顺序测试剧', current, new Map());
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(started, candidates.map(item => item.sid));
+      [...candidates].reverse().forEach(anime => {
+        const index = candidates.indexOf(anime);
+        resolvers.get(anime.sid)({
+          summary: { animeId: 900000 + index, bangumiId: String(900000 + index), animeTitle: anime.name, type: '韩剧', typeDescription: '韩剧', imageUrl: '', startDate: '2025-01-01T00:00:00Z', episodeCount: 1, rating: 0, isFavorited: true, source: 'hanjutv' },
+          links: [{ name: '第1集', url: `hxq:${anime.sid}`, title: '【hanjutv】 第1集' }],
+        });
+      });
+      const expected = candidates.map(item => item.name);
+      assert.deepEqual((await task).map(item => item.animeTitle), expected);
+      assert.deepEqual(current.map(item => item.animeTitle), expected);
+      assert.deepEqual(Globals.animes.map(item => item.animeTitle), expected);
+    } finally {
+      Globals.animes = previous.animes;
+      Globals.episodeIds = previous.episodeIds;
+      Globals.episodeNum = previous.episodeNum;
+    }
+  });
+
+  await t.test('Hanjutv should merge only exact titles and disambiguate duplicate names', async () => {
+    const source = new HanjutvSource();
+    const getMergedPairs = (keyword, s5Items, tvItems) => source
+      .mergeSearchCandidates(keyword, s5Items, tvItems)
+      .resultList
+      .filter(item => item._variant === 'merged')
+      .map(item => [item.sid, item.tvSid])
+      .sort((left, right) => left[0].localeCompare(right[0]));
+
+    const taxi = source.mergeSearchCandidates('模范出租车', [
+      { sid: 's3', name: '模范出租车3' },
+      { sid: 's2', name: '模范出租车2' },
+    ], [
+      { sid: 't2', name: '模范出租车2' },
+      { sid: 't3', name: '模范出租车3' },
+    ]).resultList.filter(item => item._variant === 'merged');
+    assert.deepEqual(taxi.map(item => [item.name, item.tvSid]), [
+      ['模范出租车3', 't3'],
+      ['模范出租车2', 't2'],
+    ]);
+
+    const duplicate = source.mergeSearchCandidates('配对游戏', [
+      { sid: 's-new', name: '配对游戏', playMode: 100, publishTime: '2025-01-01', lastSerialNo: 6 },
+      { sid: 's-old', name: '配对游戏', playMode: 101, publishTime: '2024-01-01', lastSerialNo: 63 },
+    ], [
+      { sid: 't-old', name: '配对游戏', playMode: 101, publishTime: '2024-01-01', lastSerialNo: 63 },
+      { sid: 't-new', name: '配对游戏', playMode: 100, publishTime: '2025-01-01', lastSerialNo: 6 },
+    ]).resultList.filter(item => item._variant === 'merged');
+    assert.deepEqual(duplicate.map(item => item.tvSid), ['t-new', 't-old']);
+
+    const partialS5 = [
+      { sid: 's-unknown', name: '同名剧', playMode: 100, category: 1 },
+      { sid: 's-2025', name: '同名剧', playMode: 100, publishTime: '2025-01-01', category: 1 },
+    ];
+    const datedTv = [
+      { sid: 't-2025', name: '同名剧', playMode: 100, publishTime: '2025-01-01', category: 1 },
+    ];
+    for (const s5Order of [partialS5, [...partialS5].reverse()]) {
+      assert.deepEqual(getMergedPairs('同名剧', s5Order, datedTv), [['s-2025', 't-2025']]);
+    }
+
+    const ambiguousS5 = [
+      { sid: 's-a', name: '歧义剧', playMode: 100, category: 1 },
+      { sid: 's-b', name: '歧义剧', playMode: 100, category: 1 },
+    ];
+    const ambiguousTv = [{ sid: 't-only', name: '歧义剧', playMode: 100, category: 1 }];
+    assert.deepEqual(getMergedPairs('歧义剧', ambiguousS5, ambiguousTv), []);
+    assert.deepEqual(getMergedPairs('歧义剧', [...ambiguousS5].reverse(), ambiguousTv), []);
+
+    assert.deepEqual(getMergedPairs('待播剧', [
+      { sid: 's-upcoming', name: '待播剧', playMode: 100, category: 1 },
+    ], [
+      { sid: 't-upcoming', name: '待播剧', playMode: 100, category: 1 },
+    ]), [['s-upcoming', 't-upcoming']]);
+
+    const eliminationS5 = [
+      { sid: 's-known', name: '排除剧', playMode: 100, publishTime: '2025-01-01', category: 1 },
+      { sid: 's-left', name: '排除剧', playMode: 100, category: 1 },
+    ];
+    const eliminationTv = [
+      { sid: 't-left', name: '排除剧', playMode: 100, category: 1 },
+      { sid: 't-known', name: '排除剧', playMode: 100, publishTime: '2025-01-01', category: 1 },
+    ];
+    const expectedEliminationPairs = [['s-known', 't-known'], ['s-left', 't-left']];
+    for (const s5Order of [eliminationS5, [...eliminationS5].reverse()]) {
+      for (const tvOrder of [eliminationTv, [...eliminationTv].reverse()]) {
+        assert.deepEqual(getMergedPairs('排除剧', s5Order, tvOrder), expectedEliminationPairs);
+      }
+    }
+  });
+
+  await t.test('Hanjutv should parse search-pair years without confusing seconds and milliseconds', () => {
+    const source = new HanjutvSource();
+    assert.equal(source.getSearchPairYear({ publishTime: 888768000000 }), 1998);
+    assert.equal(source.getSearchPairYear({ publishTime: '956678400000' }), 2000);
+    assert.equal(source.getSearchPairYear({ publishTime: 1735689600 }), 2025);
+    assert.equal(source.getSearchPairYear({ publishTime: '20250101' }), 2025);
+    assert.equal(source.getSearchPairYear({ releaseTime: '2025-07-11T00:00:00Z' }), 2025);
+    assert.equal(source.getSearchPairYear({ publishTime: 0, searchMemo: '1998·韩剧·敬请期待' }), 1998);
+    assert.equal(source.getSearchPairYear({ publishTime: 'not-a-date' }), null);
+    assert.equal(source.getSearchPairYear({ publishTime: 253402300800000 }), null);
+
+    assert.equal(source.isMergeableSearchPair(
+      { name: '千禧剧', publishTime: 974788882000 },
+      { name: '千禧剧', publishTime: 974820151000 },
+    ), true);
+  });
+
   // await t.test('GET hanjutv search', async () => {
   //   const res = await hanjutvSource.search("犯罪现场Zero");
   //   assert(res.length > 0, `Expected res.length > 0, but got ${res.length}`);
@@ -1489,6 +1724,47 @@ test('worker.js API endpoints', async (t) => {
   //   const handler = new EdgeoneHandler();
   //   const res = await handler.deploy();
   //   assert(res, `Expected res is true, but got ${res}`);
+  // });
+
+  // // 测试 Bangumi Data 本地检索功能与数据结构解析
+  // await t.test('searchBangumiData', async () => {
+  //   const originalUseBangumiData = Globals.getConfig().useBangumiData;
+  //   Globals.getConfig().useBangumiData = true;
+  //   try {
+  //     // 确保 Bangumi Data 核心数据源加载至内存
+  //     await initBangumiData('node', true);
+  //     const keyword = '间谍过家家';
+  //     const targetSites = ['gamer', 'gamer_hk'];
+  //     // 执行本地内存级检索
+  //     const results = await searchBangumiData(keyword, targetSites);
+  //     assert(Array.isArray(results), `Expected Array.isArray(results) to be true, but got ${typeof results}`);
+  //     assert(results.length > 0, `Expected results.length > 0, but got ${results.length}`);
+  //     if (results.length > 0) {
+  //       assert(results[0].title !== undefined, `Expected results[0].title !== undefined`);
+  //       assert(results[0].siteId !== undefined, `Expected results[0].siteId !== undefined`);
+  //     }
+  //   } finally {
+  //     clearBangumiDataCache();
+  //     Globals.getConfig().useBangumiData = originalUseBangumiData;
+  //   }
+  // });
+
+  // // 测试带有季度参数的精确拦截与检索机制
+  // await t.test('searchAnimeWithSeason', async () => {
+  //   const config = Globals.getConfig();
+  //   const originalSourceOrderArr = Array.isArray(config.sourceOrderArr) ? [...config.sourceOrderArr] : config.sourceOrderArr;
+  //   config.sourceOrderArr = ['360','iqiyi','dandan','animeko'];
+  //   try {
+  //     // 构造带有 season 参数的 URL 请求对象以模拟 match 接口的内部下发
+  //     const targetUrl = new URL('http://localhost/search/anime?keyword=间谍过家家&season=2');
+  //     const response = await searchAnime(targetUrl);
+  //     const data = await parseResponse(response);
+  //     assert.equal(data.success, true);
+  //     assert(Array.isArray(data.animes), `Expected Array.isArray(data.animes) to be true`);
+  //     assert(data.animes.length > 0, `Expected data.animes.length > 0, but got ${data.animes.length}`);
+  //   } finally {
+  //     config.sourceOrderArr = originalSourceOrderArr;
+  //   }
   // });
 
 });
